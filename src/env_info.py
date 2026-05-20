@@ -46,8 +46,17 @@ def gather_environment_info() -> Dict[str, Any]:
         info['cuda_available'] = torch.cuda.is_available()
         info['gpu_count'] = torch.cuda.device_count()
         info['gpu_names'] = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+
+        try:
+            info['mps_built'] = torch.backends.mps.is_built()
+            info['mps_available'] = torch.backends.mps.is_available()
+        except Exception:
+            info['mps_built'] = False
+            info['mps_available'] = False
     except Exception:
         info['cuda_available'] = False
+        info['mps_built'] = False
+        info['mps_available'] = False
 
     if info['nvidia_smi']:
         for line in info['nvidia_smi'].splitlines():

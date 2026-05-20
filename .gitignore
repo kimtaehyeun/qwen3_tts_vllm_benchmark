@@ -55,3 +55,19 @@ temp/
 data/
 reference/
 *.prom
+
+# External workspace directories (symlinked or adjacent)
+datasets/
+models/
+
+# Audio / model checkpoint files
+*.wav
+*.flac
+*.mp3
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Jupyter
+.ipynb_checkpoints/

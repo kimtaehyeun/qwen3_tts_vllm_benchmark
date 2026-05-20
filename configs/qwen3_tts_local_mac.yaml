@@ -1,0 +1,32 @@
+run:
+  name: qwen3_tts_local_mac
+  seed: 66
+
+model:
+  model_id: Qwen/Qwen3-TTS-12Hz-1.7B-Base
+  cache_dir: ~/Workspace/models/qwen3_tts_vllm_benchmark/hf_cache
+
+manifest:
+  path: ~/Workspace/datasets/qwen3_tts_vllm_benchmark/reference_manifest.csv
+  audio_root: ~/Workspace/datasets/qwen3_tts_vllm_benchmark/audio
+
+benchmark:
+  limit: null
+  batch_size: 1
+  warmup_requests: 1
+  save_audio: true
+  output_root: ~/Workspace/results/qwen3_tts_vllm_benchmark
+  log_root: ~/Workspace/logs/qwen3_tts_vllm_benchmark
+
+torch_runtime:
+  device: auto
+  dtype: auto
+  attn_implementation: sdpa
+  max_new_tokens: 512
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 50
+  do_sample: true
+  use_cache: true
+  non_streaming_mode: true
+  quantization: none
