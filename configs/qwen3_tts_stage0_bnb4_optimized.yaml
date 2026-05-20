@@ -18,7 +18,7 @@ stage_args:
       engine_output_type: latent
       gpu_memory_utilization: 0.3
       distributed_executor_backend: "mp"
-      max_num_batched_tokens: 512
+      max_num_batched_tokens: 768
       max_model_len: 4096
       load_format: bitsandbytes
       quantization: bitsandbytes
@@ -81,7 +81,7 @@ runtime:
       extra:
         shm_threshold_bytes: 65536
         codec_streaming: true
-        connector_get_sleep_s: 0.01
+        connector_get_sleep_s: 0.005
         connector_get_max_wait_first_chunk: 3000
         connector_get_max_wait: 300
         codec_chunk_frames: 25

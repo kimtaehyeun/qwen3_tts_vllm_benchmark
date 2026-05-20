@@ -43,6 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--repeat-per-sample', type=int, help='Repeat each sample this many times')
     parser.add_argument('--batch-size', type=int, default=1, help='Logical batch size for grouping/reporting samples')
     parser.add_argument('--metrics-sample-interval-sec', type=float, help='GPU/process metrics sampling interval seconds')
+    parser.add_argument('--write-partial-csv-every-n', type=int, help='Write Colab-compatible partial manifest every N completed requests; 0 disables periodic partial writes')
     parser.add_argument('--subset', action='append', help='Subset filter: clean, noisy, numeric')
     parser.add_argument('--limit', type=int, help='Limit number of manifest rows for benchmark')
     parser.add_argument('--seed', type=int, help='Random seed for manifest ordering')
@@ -88,6 +89,8 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
         config['benchmark']['batch_size'] = args.batch_size
     if args.metrics_sample_interval_sec is not None:
         config['benchmark']['metrics_sample_interval_sec'] = args.metrics_sample_interval_sec
+    if args.write_partial_csv_every_n is not None:
+        config['benchmark']['write_partial_csv_every_n'] = args.write_partial_csv_every_n
     if args.subset is not None:
         config['benchmark']['subset'] = args.subset
     if args.limit is not None:
@@ -467,6 +470,8 @@ def _write_colab_summary(
         'rtf_median': group_summary.get('rtf_median'),
         'rtf_p90': group_summary.get('rtf_p90'),
         'rtf_p95': group_summary.get('rtf_p95'),
+        'aggregate_rtf': group_summary.get('aggregate_rtf'),
+        'aggregate_audio_throughput_sec_per_sec': group_summary.get('aggregate_audio_throughput_sec_per_sec'),
         'time_to_first_audio_chunk_p50_sec': group_summary.get('time_to_first_audio_chunk_p50_sec'),
         'time_to_first_audio_chunk_p95_sec': group_summary.get('time_to_first_audio_chunk_p95_sec'),
         'steady_state_streaming_rtf_mean': group_summary.get('steady_state_streaming_rtf_mean'),
@@ -523,6 +528,17 @@ def compute_group_summary(records: List[Dict[str, Any]], bench_start: float, ben
     post_first_audio_chunk_latency_values = _finite_values(success_records, 'post_first_audio_chunk_latency_sec', sort_values=True)
     steady_state_audio_throughput_values = _finite_values(success_records, 'steady_state_audio_throughput_sec_per_sec', sort_values=True)
     steady_state_streaming_rtf_values = _finite_values(success_records, 'steady_state_streaming_rtf', sort_values=True)
+    audio_duration_total = sum(audio_durations) if audio_durations else None
+    aggregate_audio_throughput = (
+        audio_duration_total / bench_duration
+        if audio_duration_total is not None and bench_duration and bench_duration > 0
+        else None
+    )
+    aggregate_rtf = (
+        bench_duration / audio_duration_total
+        if audio_duration_total and audio_duration_total > 0 and bench_duration and bench_duration > 0
+        else None
+    )
     return {
         'concurrency': concurrency,
         'num_requests': total,
@@ -547,7 +563,9 @@ def compute_group_summary(records: List[Dict[str, Any]], bench_start: float, ben
         'end_to_end_rtf_p50': _percentile(rtf_values, 50) if rtf_values else None,
         'end_to_end_rtf_p95': _percentile(rtf_values, 95) if rtf_values else None,
         'audio_duration_mean_sec': statistics.mean(audio_durations) if audio_durations else None,
-        'audio_duration_total_sec': sum(audio_durations) if audio_durations else None,
+        'audio_duration_total_sec': audio_duration_total,
+        'aggregate_audio_throughput_sec_per_sec': aggregate_audio_throughput,
+        'aggregate_rtf': aggregate_rtf,
         'audio_throughput_mean_sec_per_sec': statistics.mean(throughput_values) if throughput_values else None,
         'end_to_end_audio_throughput_mean_sec_per_sec': statistics.mean(throughput_values) if throughput_values else None,
         'post_first_audio_chunk_latency_mean_sec': statistics.mean(post_first_audio_chunk_latency_values) if post_first_audio_chunk_latency_values else None,
@@ -839,10 +857,8 @@ async def _run_requests(
             await asyncio.sleep(wait_sec)
 
     def _append_record(record: Dict[str, Any]) -> None:
-        if warmup:
-            return
         records.append(record)
-        if on_record is not None:
+        if not warmup and on_record is not None:
             try:
                 on_record(record)
             except Exception:
@@ -1041,7 +1057,7 @@ def main() -> None:
         warmup_count_done = len(warmup_samples)
         warmup_client = TTSClient(api_base, {**config['tts'], 'save_audio': False}, timeout_sec=timeout_sec)
         try:
-            asyncio.run(_run_requests(
+            warmup_records = asyncio.run(_run_requests(
                 warmup_client,
                 warmup_samples,
                 run_id,
@@ -1052,7 +1068,11 @@ def main() -> None:
                 batch_size=batch_size,
                 progress_desc='warmup',
             ))
-            warmup_ok = len(warmup_samples)
+            warmup_ok = sum(1 for record in warmup_records if record.get('success'))
+            if warmup_ok != len(warmup_samples):
+                error_path = os.path.join(log_dir, f'{run_id}_warmup_records.jsonl')
+                _write_jsonl(error_path, warmup_records)
+                print(f'Warmup completed with {warmup_ok}/{len(warmup_samples)} successful requests. Details: {error_path}')
         except Exception:
             error_path = os.path.join(log_dir, f'{run_id}_warmup_error.txt')
             with open(error_path, 'w', encoding='utf-8') as f:

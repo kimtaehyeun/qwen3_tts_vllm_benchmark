@@ -1,5 +1,5 @@
 run:
-  run_name: qwen3_tts_reference_omni_vllm_omni
+  run_name: qwen3_tts_reference_300_vllm_omni_bnb4_optimized
   seed: 66
 
 server:
@@ -14,13 +14,20 @@ server:
   max_num_seqs: 8
   max_model_len: null
   trust_remote_code: true
-  stage_configs_path: qwen3_tts.yaml
+  stage_configs_path: configs/qwen3_tts_stage0_bnb4_optimized.yaml
   allowed_local_media_path: /workspace/qwen3_tts_vllm_benchmark/data/reference/Audio/reference/reference
+  quantization: bitsandbytes
+  quantization_scope: stage0_talker_llm_mtp
+  load_format: bitsandbytes
+  bit_width: 4
+  llm_bit: 4
+  mtp_bit: 4
+  mtp_quantization: bitsandbytes
   extra_vllm_args: []
 
 tts:
   endpoint: /v1/audio/speech
-  task_type: Omni
+  task_type: Base
   payload_mode: qwen3_tts_base
   request_mode: json_with_path
   response_format: wav
@@ -37,11 +44,12 @@ manifest:
   path_prefix_to: /workspace/qwen3_tts_vllm_benchmark/data/reference/Audio/reference/reference
 
 benchmark:
-  warmup_requests: 5
-  concurrency: [1, 2, 4]
+  warmup_requests: 3
+  concurrency: [8]
   batch_size: 1
   request_rate: inf
   timeout_sec: 300
-  save_audio: true
-  metrics_sample_interval_sec: 0.5
+  save_audio: false
+  metrics_sample_interval_sec: 1.0
   repeat_per_sample: 1
+  write_partial_csv_every_n: 0

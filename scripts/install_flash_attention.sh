@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_PATH="${1:-configs/qwen3_tts_base.yaml}"
+CONFIG_PATH="${1:-configs/qwen3_tts_base_optimized.yaml}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 

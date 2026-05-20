@@ -181,7 +181,22 @@ def make_int4_layer(linear: nn.Linear, compute_dtype: torch.dtype) -> nn.Module:
     )
     if linear.bias is not None:
         new_mod.bias = nn.Parameter(linear.bias.detach().cpu().clone(), requires_grad=False)
+    force_linear_output_dtype(new_mod, compute_dtype)
     return new_mod
+
+
+def force_linear_output_dtype(module: nn.Module, output_dtype: torch.dtype) -> None:
+    """Keep BNB 4-bit projection outputs compatible with FlashAttention q/k dtype checks."""
+    original_forward = module.forward
+
+    def forward_with_output_dtype(input_tensor: torch.Tensor) -> torch.Tensor:
+        output = original_forward(input_tensor)
+        if torch.is_tensor(output) and output.dtype != output_dtype:
+            return output.to(output_dtype)
+        return output
+
+    module.forward = forward_with_output_dtype  # type: ignore[method-assign]
+    setattr(module, '_forced_output_dtype', dtype_to_str(output_dtype))
 
 
 def get_new_weight_dtype_repr(module: nn.Module) -> str:
@@ -372,7 +387,7 @@ def load_torch_model(config: Dict[str, Any], output_dir: str) -> Tuple[Any, Dict
         if importlib.util.find_spec('flash_attn') is None:
             raise ImportError(
                 'flash_attn is required because torch_runtime.require_flash_attention=true. '
-                'Run: bash scripts/install_flash_attention.sh configs/qwen3_tts_base.yaml'
+                'Run: bash scripts/install_flash_attention.sh configs/qwen3_tts_base_optimized.yaml'
             )
     compute_dtype = torch.bfloat16
     cache_dir = resolve_hf_hub_cache_dir(output_dir)

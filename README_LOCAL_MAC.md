@@ -13,7 +13,7 @@ This document explains how to run Qwen3-TTS inference **directly on a MacBook (A
 | Quantization | BitsAndBytes (optional) | None (BF16/FP16/FP32) |
 | Flash Attention 2 | Supported | Not used (SDPA instead) |
 | Benchmark scripts | `benchmark_manifest.py` | `benchmark_local_mac.py` |
-| Config | `configs/qwen3_tts_base.yaml` | `configs/qwen3_tts_local_mac.yaml` |
+| Config | `configs/qwen3_tts_base_optimized.yaml` | `configs/qwen3_tts_local_mac.yaml` |
 
 **The existing RunPod benchmark code is not affected.** The local Mac path is a separate addition.
 

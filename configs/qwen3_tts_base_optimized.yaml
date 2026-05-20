@@ -1,5 +1,5 @@
 run:
-  run_name: qwen3_tts_reference_customvoice_vllm_omni
+  run_name: qwen3_tts_reference_300_vllm_omni_optimized
   seed: 66
 
 server:
@@ -14,21 +14,45 @@ server:
   max_num_seqs: 8
   max_model_len: null
   trust_remote_code: true
-  stage_configs_path: qwen3_tts.yaml
+  stage_configs_path: configs/qwen3_tts_stage0_optimized.yaml
   allowed_local_media_path: /workspace/qwen3_tts_vllm_benchmark/data/reference/Audio/reference/reference
   extra_vllm_args: []
 
 tts:
   endpoint: /v1/audio/speech
-  task_type: CustomVoice
-  payload_mode: qwen3_tts_customvoice
+  task_type: Base
+  payload_mode: qwen3_tts_base
   request_mode: json_with_path
   response_format: wav
   sample_rate: 24000
   stream: false
   language: Korean
-  voice: custom
-  instructions: "Custom voice generation"
+  voice: null
+  instructions: null
+
+torch_runtime:
+  attn_implementation: flash_attention_2
+  require_flash_attention: true
+  flash_attention:
+    install: true
+    package: flash-attn
+    version: null
+    no_build_isolation: true
+    no_cache_dir: true
+    max_jobs: 4
+    cuda_arch_list: null
+    extra_pip_args: []
+    show_progress: true
+    progress_interval_sec: 30
+    log_dir: logs
+  max_new_tokens: 512
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 50
+  do_sample: true
+  subtalker_dosample: false
+  use_cache: true
+  autocast_bf16: true
 
 manifest:
   path: /workspace/qwen3_tts_vllm_benchmark/data/reference/manifest/reference_manifest.csv
@@ -37,11 +61,12 @@ manifest:
   path_prefix_to: /workspace/qwen3_tts_vllm_benchmark/data/reference/Audio/reference/reference
 
 benchmark:
-  warmup_requests: 5
-  concurrency: [1, 2, 4]
+  warmup_requests: 3
+  concurrency: [8]
   batch_size: 1
   request_rate: inf
   timeout_sec: 300
-  save_audio: true
-  metrics_sample_interval_sec: 0.5
+  save_audio: false
+  metrics_sample_interval_sec: 1.0
   repeat_per_sample: 1
+  write_partial_csv_every_n: 0

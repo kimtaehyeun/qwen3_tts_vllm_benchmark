@@ -7,20 +7,21 @@ cd "$ROOT_DIR"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTPUT_ROOT="${OUTPUT_ROOT:-results/fourway_${STAMP}}"
 LIMIT="${LIMIT:-300}"
-WARMUP="${WARMUP:-5}"
+WARMUP="${WARMUP:-1}"
 TORCH_BATCH_SIZE="${TORCH_BATCH_SIZE:-4}"
 VLLM_BATCH_SIZE="${VLLM_BATCH_SIZE:-1}"
-CONCURRENCY="${CONCURRENCY:-1}"
+CONCURRENCY="${CONCURRENCY:-8}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
-SAVE_AUDIO_FLAG="${SAVE_AUDIO_FLAG:---save-audio}"
+SAVE_AUDIO_FLAG="${SAVE_AUDIO_FLAG:---no-save-audio}"
 INSTALL_FLASH_ATTN="${INSTALL_FLASH_ATTN:-1}"
+TORCH_CONFIG="${TORCH_CONFIG:-configs/qwen3_tts_base_optimized.yaml}"
+VLLM_BASE_CONFIG="${VLLM_BASE_CONFIG:-configs/qwen3_tts_base_optimized.yaml}"
+VLLM_BNB4_CONFIG="${VLLM_BNB4_CONFIG:-configs/qwen3_tts_bnb4_optimized.yaml}"
 
 mkdir -p "$OUTPUT_ROOT/logs"
 
 stop_server_if_running() {
-  if [ -f logs/server.pid ]; then
-    bash scripts/stop_server.sh || true
-  fi
+  bash scripts/stop_server.sh || true
 }
 
 wait_for_vllm() {
@@ -41,11 +42,11 @@ run_torch() {
   mkdir -p "$OUTPUT_ROOT/logs" "$out_dir"
   echo "=== torch ${quant} -> ${out_dir} ==="
   if [ "$INSTALL_FLASH_ATTN" = "1" ]; then
-    bash scripts/install_flash_attention.sh configs/qwen3_tts_base.yaml \
+    bash scripts/install_flash_attention.sh "$TORCH_CONFIG" \
       2>&1 | tee "${OUTPUT_ROOT}/logs/install_flash_attention_$(basename "$out_dir").log"
   fi
   python -u -m src.benchmark_torch \
-    --config configs/qwen3_tts_base.yaml \
+    --config "$TORCH_CONFIG" \
     --output-dir "$out_dir" \
     --quantization "$quant" \
     --warmup-requests "$WARMUP" \
@@ -103,13 +104,14 @@ PY
 
 echo "Output root: ${OUTPUT_ROOT}"
 echo "LIMIT=${LIMIT} WARMUP=${WARMUP} TORCH_BATCH_SIZE=${TORCH_BATCH_SIZE} VLLM_BATCH_SIZE=${VLLM_BATCH_SIZE} CONCURRENCY=${CONCURRENCY}"
+echo "TORCH_CONFIG=${TORCH_CONFIG} VLLM_BASE_CONFIG=${VLLM_BASE_CONFIG} VLLM_BNB4_CONFIG=${VLLM_BNB4_CONFIG} SAVE_AUDIO_FLAG=${SAVE_AUDIO_FLAG}"
 
 stop_server_if_running
 
 run_torch none "${OUTPUT_ROOT}/01_torch_bf16"
-run_vllm configs/qwen3_tts_base.yaml "${OUTPUT_ROOT}/02_vllm_bf16"
+run_vllm "$VLLM_BASE_CONFIG" "${OUTPUT_ROOT}/02_vllm_bf16"
 run_torch bnb4 "${OUTPUT_ROOT}/03_torch_llm4_mtp4"
-run_vllm configs/qwen3_tts_bnb4.yaml "${OUTPUT_ROOT}/04_vllm_llm4_mtp4"
+run_vllm "$VLLM_BNB4_CONFIG" "${OUTPUT_ROOT}/04_vllm_llm4_mtp4"
 
 python -m src.compare_benchmarks \
   --run-dir "${OUTPUT_ROOT}/01_torch_bf16" \

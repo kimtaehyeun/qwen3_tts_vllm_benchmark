@@ -27,7 +27,7 @@ Key differences:
 - Runtime: Colab used direct PyTorch/HF calls; this repo uses `vllm-omni serve`.
 - Attention: Colab set `attn_implementation="flash_attention_2"`; vLLM logs show `FLASH_ATTN` and `Using FlashAttention version 2`.
 - dtype: both use BF16 for the current L4/Ampere-style setup.
-- Quantization: Colab had low-bit plans (`bnb_int8`, `bnb_nf4`, `hqq_3bit/2bit`). The default vLLM setup is BF16. A BitsAndBytes 4bit vLLM config is included for stage 0, the Qwen3-TTS talker LLM plus MTP body, with stage 1 left in the default dtype for audio decoding.
+- Quantization: Colab had low-bit plans (`bnb_int8`, `bnb_nf4`, `hqq_3bit/2bit`). The default vLLM setup is BF16. BitsAndBytes 4bit vLLM configs are included for stage 0, the Qwen3-TTS talker LLM plus MTP body, with stage 1 left in the default dtype for audio decoding.
 - Batch behavior: Colab used HF batch generation; this benchmark sends individual HTTP requests and controls parallelism with `--concurrency`.
 - Logging: the benchmark now writes both original benchmark files and Colab-compatible files.
 
@@ -40,7 +40,7 @@ bash scripts/install_runpod.sh
 ## Launch vLLM server
 
 ```bash
-bash scripts/launch_server.sh configs/qwen3_tts_base.yaml
+bash scripts/launch_server.sh configs/qwen3_tts_base_optimized.yaml
 ```
 
 Follow the latest server log until the API is ready:
@@ -63,11 +63,10 @@ Expected checks:
 
 ## vLLM 4bit BitsAndBytes config
 
-The repository includes a BitsAndBytes 4bit configuration for the vLLM-Omni runtime:
+The repository includes final optimized BitsAndBytes 4bit configurations for the vLLM-Omni runtime:
 
-- `configs/qwen3_tts_bnb4.yaml` - benchmark/server config that records `quant_method=bitsandbytes`, `llm_bit=4`, `mtp_bit=4`, and `mtp_quant_method=int4_weightonly`
-- `configs/qwen3_tts_stage0_bnb4.yaml` - vLLM-Omni stage config with BitsAndBytes applied to stage 0, the Qwen3-TTS talker LLM
-- MTP/code predictor body linear layers are converted to a custom `int4_weightonly` linear path. This avoids the BitsAndBytes `Linear4bit` MTP path, which started but timed out during generation in this environment.
+- `configs/qwen3_tts_bnb4_optimized.yaml` - final benchmark/server config that records `quant_method=bitsandbytes`, `llm_bit=4`, `mtp_bit=4`, and `mtp_quant_method=bitsandbytes`
+- `configs/qwen3_tts_stage0_bnb4_optimized.yaml` - final vLLM-Omni stage config with BitsAndBytes applied to stage 0, the Qwen3-TTS talker LLM plus MTP/code predictor linear modules
 - Stage 1, `Qwen3TTSCode2Wav`, is intentionally left unquantized because it is the audio decoder path
 
 This environment needs a compatibility patch because upstream vLLM-Omni does not currently expose `packed_modules_mapping` on `Qwen3TTSTalkerForConditionalGeneration`, vLLM's BitsAndBytes loader can otherwise match nested `code_predictor.model.layers` weights too broadly, and the Qwen3-TTS MTP/code predictor is implemented with plain PyTorch `nn.Linear` layers rather than vLLM quantized linear layers. Apply the patch after installing dependencies or after reinstalling `vllm` / `vllm-omni`:
@@ -79,7 +78,7 @@ bash scripts/patch_vllm_qwen3_tts_bnb4.sh
 Then launch the 4bit server:
 
 ```bash
-bash scripts/launch_server.sh configs/qwen3_tts_bnb4.yaml
+bash scripts/launch_server.sh configs/qwen3_tts_bnb4_optimized.yaml
 ```
 
 Confirm the server is using BitsAndBytes:
@@ -94,16 +93,16 @@ Expected log markers:
 load_format=bitsandbytes
 quantization=bitsandbytes
 Loading weights with BitsAndBytes quantization
-code_predictor: int4_weightonly enabled for 36 MTP Linear modules
+code_predictor: Linear4bit/quant inventory entries for MTP modules
 Using FlashAttention version 2
 Application startup complete
 ```
 
-Current behavior observed for LLM BitsAndBytes 4bit + MTP `int4_weightonly`:
+Current behavior observed for LLM BitsAndBytes 4bit + MTP BitsAndBytes:
 
 - Server startup succeeds.
 - `/health` and `/v1/models` succeed.
-- Logs confirm LLM BitsAndBytes and MTP `int4_weightonly`.
+- Logs confirm LLM BitsAndBytes and MTP quant inventory dumps.
 - A direct short-text request succeeded with HTTP 200 in about 9.3s.
 - A one-sample manifest smoke run succeeded with HTTP 200 in about 26.1s, `rtf_mean=1.61`.
 
@@ -111,8 +110,8 @@ Use this smoke command to reproduce the current LLM+MTP 4bit behavior:
 
 ```bash
 python -u -m src.benchmark_manifest \
-  --config configs/qwen3_tts_bnb4.yaml \
-  --output-dir results/bnb4_llm_mtp_int4_smoke \
+  --config configs/qwen3_tts_bnb4_optimized.yaml \
+  --output-dir results/bnb4_llm_mtp_bnb4_smoke \
   --warmup-requests 0 \
   --concurrency 1 \
   --batch-size 1 \
@@ -121,13 +120,65 @@ python -u -m src.benchmark_manifest \
   --response-format wav
 ```
 
+## vLLM throughput optimization
+
+The default upstream Qwen3-TTS vLLM-Omni stage config has a clear throughput limiter:
+
+```text
+stage 0 talker:  max_num_seqs: 10
+stage 1 code2wav: max_num_seqs: 1
+runtime defaults: max_inflight: 1
+```
+
+That means the LLM/talker stage can accept multiple requests, but the final audio decoder stage is effectively serialized. GPU utilization can therefore bounce below 100% even when `--concurrency 8` is used.
+
+The optimized configs keep the stable vLLM-Omni scheduling limits and reduce client-side benchmark overhead:
+
+- `configs/qwen3_tts_base_optimized.yaml`
+- `configs/qwen3_tts_bnb4_optimized.yaml`
+- `configs/qwen3_tts_stage0_optimized.yaml`
+- `configs/qwen3_tts_stage0_bnb4_optimized.yaml`
+
+Key changes:
+
+- server-level `max_num_seqs: 8`
+- stage 0 `max_num_seqs: 10`
+- stage 0 `max_num_batched_tokens: 768`
+- stage 1 `max_num_seqs: 1`
+- runtime `max_inflight: 1`
+- connector polling sleep `0.01s -> 0.005s`
+- benchmark `write_partial_csv_every_n: 0` to avoid rewriting the full partial manifest every few requests
+- benchmark `save_audio: false` in optimized configs to avoid disk I/O during speed runs
+
+Use the optimized BF16 server like this:
+
+```bash
+bash scripts/stop_server.sh || true
+bash scripts/launch_server.sh configs/qwen3_tts_base_optimized.yaml
+until curl -fsS http://127.0.0.1:8091/v1/models >/dev/null; do sleep 5; done
+
+python -u -m src.benchmark_manifest \
+  --config configs/qwen3_tts_base_optimized.yaml \
+  --output-dir results/vllm_bf16_optimized_c8 \
+  --warmup-requests 1 \
+  --concurrency 8 \
+  --batch-size 1 \
+  --limit 300 \
+  --timeout-sec 300 \
+  --no-save-audio \
+  --write-partial-csv-every-n 0 \
+  --response-format wav
+```
+
+In this environment, raising stage 1 `code2wav` to `max_num_seqs: 2` caused repeated `Dropping output for unknown req` orchestrator warnings and worse latency. The stable optimized profile therefore keeps stage 1 serialized and focuses on avoiding avoidable client-side I/O during speed runs.
+
 ## Run benchmark on 300 reference manifest samples
 
 The checked-in reference manifest has 300 samples. If `--limit` is omitted, all valid manifest rows are used.
 
 ```bash
 python -u -m src.benchmark_manifest \
-  --config configs/qwen3_tts_base.yaml \
+  --config configs/qwen3_tts_base_optimized.yaml \
   --output-dir results/reference_all_c1 \
   --warmup-requests 5 \
   --concurrency 1 \
@@ -146,7 +197,7 @@ Examples:
 ```bash
 # Run all 300 samples, max 2 concurrent requests.
 python -u -m src.benchmark_manifest \
-  --config configs/qwen3_tts_base.yaml \
+  --config configs/qwen3_tts_base_optimized.yaml \
   --output-dir results/reference_all_parallel_c2 \
   --warmup-requests 5 \
   --concurrency 2 \
@@ -157,9 +208,9 @@ python -u -m src.benchmark_manifest \
 
 ```bash
 # Run all 300 samples, max 8 concurrent requests.
-# Current server config uses max_num_seqs: 8, so this is a practical first high-throughput test.
+# Current optimized server config uses max_num_seqs: 8, so this is a practical first high-throughput test.
 python -u -m src.benchmark_manifest \
-  --config configs/qwen3_tts_base.yaml \
+  --config configs/qwen3_tts_base_optimized.yaml \
   --output-dir results/reference_all_parallel_c8 \
   --warmup-requests 5 \
   --concurrency 8 \
@@ -179,11 +230,13 @@ Behavior:
 
 The benchmark uses a worker queue internally, so `--concurrency 8` means up to 8 HTTP inference requests are in flight regardless of `--batch-size`.
 
+For throughput runs, prefer the optimized configs and start with `--concurrency 8`. Use `aggregate_rtf` and `aggregate_audio_throughput_sec_per_sec` to judge system throughput under concurrency; per-request `rtf_mean` includes queueing and can look worse as concurrency increases.
+
 ## Smoke test
 
 ```bash
 python -u -m src.benchmark_manifest \
-  --config configs/qwen3_tts_base.yaml \
+  --config configs/qwen3_tts_base_optimized.yaml \
   --output-dir results/smoke_test \
   --warmup-requests 2 \
   --concurrency 1 \
@@ -199,7 +252,7 @@ The benchmark prints a `tqdm` progress bar for warmup and each concurrency run. 
 SERVER_LOG="$(ls -t logs/server_*.log | head -n1)"
 
 python -u -m src.benchmark_manifest \
-  --config configs/qwen3_tts_base.yaml \
+  --config configs/qwen3_tts_base_optimized.yaml \
   --output-dir results/reference_all_parallel_c8 \
   --warmup-requests 5 \
   --concurrency 8 \
@@ -265,7 +318,7 @@ Streaming-oriented steady-state metrics are calculated only when the request suc
 
 The OpenAI-compatible `/v1/audio/speech` endpoint usually returns audio bytes rather than a token usage JSON payload. In that case token/s fields remain empty and `token_metric_status` is recorded as `unavailable_from_endpoint_or_metrics`. Token throughput is calculated only when token counts are actually present in endpoint metadata or server metrics.
 
-For the default BF16 vLLM run, quantization fields are recorded as `none`/`bf16`. For `configs/qwen3_tts_bnb4.yaml`, run settings and summary fields record `llm_quant_method=bitsandbytes`, `mtp_quant_method=int4_weightonly`, `llm_bit=4`, and `mtp_bit=4`. HF direct-load fields such as `load_time_sec` and `model_memory_footprint_mb` are not directly available from the benchmark client, so they are left empty while vLLM/GPU metrics are recorded separately.
+For the default BF16 vLLM run, quantization fields are recorded as `none`/`bf16`. For `configs/qwen3_tts_bnb4_optimized.yaml`, run settings and summary fields record `llm_quant_method=bitsandbytes`, `mtp_quant_method=bitsandbytes`, `llm_bit=4`, and `mtp_bit=4`. HF direct-load fields such as `load_time_sec` and `model_memory_footprint_mb` are not directly available from the benchmark client, so they are left empty while vLLM/GPU metrics are recorded separately.
 
 ## Summarize results
 
@@ -317,7 +370,7 @@ LIMIT=1 WARMUP=0 CONCURRENCY=1 bash scripts/run_4way_benchmark.sh
 
 The comparison table includes latency, RTF, audio throughput, steady-state streaming metrics when available, success rate, GPU memory peak/mean, GPU utilization, load time, and model memory footprint. Torch direct runtime does not expose a real first audio chunk timestamp, so its steady-state streaming metrics remain unavailable with `steady_state_metric_status=missing_time_to_first_audio_chunk`.
 
-For torch direct runtime, `configs/qwen3_tts_base.yaml` now forces `attn_implementation: flash_attention_2` and `require_flash_attention: true`. If `flash_attn` is missing, `python -m src.benchmark_torch` stops with a clear install command instead of silently falling back to `sdpa`.
+For torch direct runtime, `configs/qwen3_tts_base_optimized.yaml` forces `attn_implementation: flash_attention_2` and `require_flash_attention: true`. If `flash_attn` is missing, `python -m src.benchmark_torch` stops with a clear install command instead of silently falling back to `sdpa`.
 
 The torch config can also install FlashAttention before running:
 
@@ -339,7 +392,7 @@ torch_runtime:
 Manual install with progress logging:
 
 ```bash
-bash scripts/install_flash_attention.sh configs/qwen3_tts_base.yaml
+bash scripts/install_flash_attention.sh configs/qwen3_tts_base_optimized.yaml
 ```
 
 The installer streams pip/ninja/nvcc output to stdout and writes a log like `logs/flash_attention_install_<timestamp>.log`. When `show_progress=true`, it also prints periodic process and disk status while the CUDA extension is compiling.
