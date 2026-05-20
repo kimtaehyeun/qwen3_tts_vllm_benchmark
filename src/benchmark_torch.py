@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--timeout-sec', type=int)
     parser.add_argument('--save-audio', dest='save_audio', action='store_true')
     parser.add_argument('--no-save-audio', dest='save_audio', action='store_false')
-    parser.add_argument('--attn-implementation', default='auto')
+    parser.add_argument('--attn-implementation')
     parser.add_argument('--max-new-tokens', type=int, default=512)
     parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--top-p', type=float, default=0.95)
@@ -105,7 +105,8 @@ def merge_config(config: Dict[str, Any], args: argparse.Namespace) -> Dict[str, 
         config['run']['seed'] = args.seed
 
     config['torch_runtime']['quantization'] = args.quantization
-    config['torch_runtime']['attn_implementation'] = args.attn_implementation
+    if args.attn_implementation is not None:
+        config['torch_runtime']['attn_implementation'] = args.attn_implementation
     config['torch_runtime']['max_new_tokens'] = args.max_new_tokens
     config['torch_runtime']['temperature'] = args.temperature
     config['torch_runtime']['top_p'] = args.top_p
@@ -318,6 +319,16 @@ def resolve_local_model_path(model_id: str, cache_dir: Path) -> Path:
     return root_dir
 
 
+def resolve_hf_hub_cache_dir(output_dir: str) -> Path:
+    hub_cache = os.environ.get('HUGGINGFACE_HUB_CACHE') or os.environ.get('HF_HUB_CACHE')
+    if hub_cache:
+        return Path(hub_cache).expanduser()
+    hf_home = os.environ.get('HF_HOME')
+    if hf_home:
+        return Path(hf_home).expanduser() / 'hub'
+    return Path.home() / '.cache' / 'huggingface' / 'hub'
+
+
 def describe_quantization(quantization: str) -> Dict[str, Any]:
     if quantization == 'bnb4':
         return {
@@ -357,8 +368,14 @@ def load_torch_model(config: Dict[str, Any], output_dir: str) -> Tuple[Any, Dict
     model_id = server.get('model_id', 'Qwen/Qwen3-TTS-12Hz-1.7B-Base')
     quantization = runtime.get('quantization', 'none')
     attn_implementation = resolve_attn_implementation(runtime.get('attn_implementation', 'auto'))
+    if attn_implementation == 'flash_attention_2' and runtime.get('require_flash_attention', False):
+        if importlib.util.find_spec('flash_attn') is None:
+            raise ImportError(
+                'flash_attn is required because torch_runtime.require_flash_attention=true. '
+                'Run: bash scripts/install_flash_attention.sh configs/qwen3_tts_base.yaml'
+            )
     compute_dtype = torch.bfloat16
-    cache_dir = Path(os.environ.get('HF_HOME', os.path.join(output_dir, 'hf_cache')))
+    cache_dir = resolve_hf_hub_cache_dir(output_dir)
     load_started = time.perf_counter()
     root_dir = resolve_local_model_path(model_id, cache_dir)
 
@@ -411,6 +428,7 @@ def load_torch_model(config: Dict[str, Any], output_dir: str) -> Tuple[Any, Dict
         'model_snapshot_disk_size_mb': directory_size_mb(root_dir),
         'disk_size_mb': directory_size_mb(root_dir),
         'model_root_dir': str(root_dir),
+        'hf_cache_dir': str(cache_dir),
     }
     return tts_wrapper, quant_report, load_meta
 
@@ -455,21 +473,30 @@ def generate_batch(tts_wrapper: Any, samples: List[BenchmarkSample], config: Dic
     languages = [guess_language(sample.target_text) for sample in samples]
     ref_audios = [sample.resolved_ref_audio_path for sample in samples]
     ref_texts = [sample.ref_text or '' for sample in samples]
-    result = tts_wrapper.generate_voice_clone(
-        text=texts,
-        language=languages,
-        ref_audio=ref_audios,
-        ref_text=ref_texts,
-        non_streaming_mode=True,
-        max_new_tokens=int(runtime.get('max_new_tokens', 512)),
-        do_sample=bool(runtime.get('do_sample', True)),
-        top_k=int(runtime.get('top_k', 50)),
-        top_p=float(runtime.get('top_p', 0.95)),
-        temperature=float(runtime.get('temperature', 1.0)),
-        subtalker_dosample=bool(runtime.get('subtalker_dosample', False)),
-        use_cache=bool(runtime.get('use_cache', True)),
-    )
+    autocast_enabled = torch.cuda.is_available() and bool(runtime.get('autocast_bf16', True))
+    with torch.inference_mode():
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=autocast_enabled):
+            result = tts_wrapper.generate_voice_clone(
+                text=texts,
+                language=languages,
+                ref_audio=ref_audios,
+                ref_text=ref_texts,
+                non_streaming_mode=True,
+                max_new_tokens=int(runtime.get('max_new_tokens', 512)),
+                do_sample=bool(runtime.get('do_sample', True)),
+                top_k=int(runtime.get('top_k', 50)),
+                top_p=float(runtime.get('top_p', 0.95)),
+                temperature=float(runtime.get('temperature', 1.0)),
+                subtalker_dosample=bool(runtime.get('subtalker_dosample', False)),
+                use_cache=bool(runtime.get('use_cache', True)),
+            )
     return unpack_generation_result(result)
+
+
+def audio_duration_from_array(wav: np.ndarray, sample_rate: int) -> Optional[float]:
+    if sample_rate <= 0:
+        return None
+    return float(len(wav)) / float(sample_rate)
 
 
 def build_output_audio_path(audio_root: str, sample: BenchmarkSample, suffix: str) -> str:
@@ -591,6 +618,7 @@ def run_generation(
                 record['end_to_end_latency_sec'] = amortized_latency
                 record['batch_end_to_end_latency_sec'] = elapsed
                 record['batch_size_actual'] = len(batch)
+                record['audio_duration_sec'] = audio_duration_from_array(wav, sample_rate)
                 if save_audio:
                     output_audio_path = build_output_audio_path(audio_root, sample, 'torch')
                     sf.write(output_audio_path, wav, sample_rate)
@@ -599,9 +627,8 @@ def run_generation(
                         record['output_audio_bytes'] = os.path.getsize(output_audio_path)
                     except OSError:
                         record['output_audio_bytes'] = None
-                    record['audio_duration_sec'] = get_audio_duration(output_audio_path)
-                else:
-                    record['audio_duration_sec'] = float(len(wav)) / float(sample_rate) if sample_rate else None
+                    if record['audio_duration_sec'] is None:
+                        record['audio_duration_sec'] = get_audio_duration(output_audio_path)
                 if record['audio_duration_sec'] and record['audio_duration_sec'] > 0 and amortized_latency and amortized_latency > 0:
                     record['rtf'] = amortized_latency / record['audio_duration_sec']
                     record['end_to_end_rtf'] = record['rtf']

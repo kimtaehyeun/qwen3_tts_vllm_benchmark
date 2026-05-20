@@ -8,11 +8,12 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 OUTPUT_ROOT="${OUTPUT_ROOT:-results/fourway_${STAMP}}"
 LIMIT="${LIMIT:-300}"
 WARMUP="${WARMUP:-5}"
-TORCH_BATCH_SIZE="${TORCH_BATCH_SIZE:-1}"
+TORCH_BATCH_SIZE="${TORCH_BATCH_SIZE:-4}"
 VLLM_BATCH_SIZE="${VLLM_BATCH_SIZE:-1}"
 CONCURRENCY="${CONCURRENCY:-1}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
 SAVE_AUDIO_FLAG="${SAVE_AUDIO_FLAG:---save-audio}"
+INSTALL_FLASH_ATTN="${INSTALL_FLASH_ATTN:-1}"
 
 mkdir -p "$OUTPUT_ROOT/logs"
 
@@ -37,7 +38,12 @@ wait_for_vllm() {
 run_torch() {
   local quant="$1"
   local out_dir="$2"
+  mkdir -p "$OUTPUT_ROOT/logs" "$out_dir"
   echo "=== torch ${quant} -> ${out_dir} ==="
+  if [ "$INSTALL_FLASH_ATTN" = "1" ]; then
+    bash scripts/install_flash_attention.sh configs/qwen3_tts_base.yaml \
+      2>&1 | tee "${OUTPUT_ROOT}/logs/install_flash_attention_$(basename "$out_dir").log"
+  fi
   python -u -m src.benchmark_torch \
     --config configs/qwen3_tts_base.yaml \
     --output-dir "$out_dir" \
@@ -53,6 +59,22 @@ run_vllm() {
   local config_path="$1"
   local out_dir="$2"
   local api_base
+  local needs_vllm_quant_patch
+  mkdir -p "$OUTPUT_ROOT/logs" "$out_dir"
+  needs_vllm_quant_patch="$(python - "$config_path" <<'PY'
+import sys
+import yaml
+with open(sys.argv[1], encoding='utf-8') as f:
+    cfg = yaml.safe_load(f)
+server = cfg.get('server', {})
+enabled = bool(server.get('quantization') == 'bitsandbytes' or server.get('mtp_quantization'))
+print('1' if enabled else '0')
+PY
+)"
+  if [ "$needs_vllm_quant_patch" = "1" ]; then
+    bash scripts/patch_vllm_qwen3_tts_bnb4.sh \
+      2>&1 | tee "${OUTPUT_ROOT}/logs/$(basename "$out_dir")_vllm_quant_patch.log"
+  fi
   api_base="$(python - "$config_path" <<'PY'
 import sys
 import yaml

@@ -401,4 +401,162 @@ def _finalize_bnb_4bit_modules(module: nn.Module) -> None:
     )
     code_predictor_path.write_text(code_text, encoding="utf-8")
     print(f"patched {code_predictor_path}: MTP Linear4bit")
+
+
+def replace_once(text: str, old: str, new: str, label: str) -> tuple[str, bool]:
+    if old not in text:
+        return text, False
+    return text.replace(old, new, 1), True
+
+
+code_text = code_predictor_path.read_text(encoding="utf-8")
+changed = False
+
+if "import json\n" not in code_text:
+    code_text = code_text.replace("import os\n", "import json\nimport os\n", 1)
+    changed = True
+if "from pathlib import Path\n" not in code_text:
+    code_text = code_text.replace("from collections.abc import Iterable\n", "from collections.abc import Iterable\nfrom pathlib import Path\n", 1)
+    changed = True
+
+old_lm_head = '''        self.lm_head = nn.ModuleList(
+            [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(config.num_code_groups - 1)]
+        )
+'''
+new_lm_head = '''        self.lm_head = nn.ModuleList(
+            [
+                _make_linear(
+                    config.hidden_size,
+                    config.vocab_size,
+                    bias=False,
+                    vllm_config=vllm_config,
+                )
+                for _ in range(config.num_code_groups - 1)
+            ]
+        )
+'''
+code_text, did_replace = replace_once(code_text, old_lm_head, new_lm_head, "MTP lm_head Linear4bit")
+if did_replace:
+    changed = True
+    print(f"patched {code_predictor_path}: MTP lm_head uses _make_linear")
+elif "_make_linear(\n                    config.hidden_size,\n                    config.vocab_size," in code_text:
+    print(f"already patched {code_predictor_path}: MTP lm_head uses _make_linear")
+else:
+    raise SystemExit(f"Could not patch {code_predictor_path}: MTP lm_head Linear4bit")
+
+inventory_helper_anchor = '''def _uses_mtp_quant(vllm_config: VllmConfig | None) -> bool:
+    if _uses_int4_weightonly(vllm_config):
+        return True
+    if _uses_bnb_4bit(vllm_config):
+        return True
+    return False
+
+
+'''
+inventory_helper = '''def _uses_mtp_quant(vllm_config: VllmConfig | None) -> bool:
+    if _uses_int4_weightonly(vllm_config):
+        return True
+    if _uses_bnb_4bit(vllm_config):
+        return True
+    return False
+
+
+def _linear_inventory_row(name: str, module: nn.Module) -> dict:
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        bnb = None
+
+    class_name = type(module).__name__
+    quantized = False
+    quant_method = "none"
+    bit_width = "fp"
+    if isinstance(module, _Int4WeightOnlyLinear):
+        quantized = True
+        quant_method = "int4_weightonly"
+        bit_width = 4
+    elif bnb is not None and isinstance(module, bnb.nn.Linear4bit):
+        quantized = True
+        quant_method = "bnb_nf4"
+        bit_width = 4
+
+    return {
+        "module_name": name,
+        "module_group": "mtp",
+        "class": class_name,
+        "in_features": int(getattr(module, "in_features", -1)),
+        "out_features": int(getattr(module, "out_features", -1)),
+        "assigned_bit_width": bit_width,
+        "quantized": int(quantized),
+        "assigned_quant_method": quant_method,
+        "weight_dtype": str(getattr(getattr(module, "weight", None), "dtype", "unknown")),
+    }
+
+
+def _dump_mtp_quant_inventory(module: nn.Module) -> None:
+    path = os.environ.get("QWEN3_TTS_MTP_INVENTORY_PATH", "").strip()
+    if not path:
+        return
+    rows = []
+    try:
+        import bitsandbytes as bnb
+    except ImportError:
+        bnb = None
+    for name, submodule in module.named_modules():
+        is_linear_like = isinstance(submodule, (nn.Linear, _Int4WeightOnlyLinear))
+        if bnb is not None:
+            is_linear_like = is_linear_like or isinstance(submodule, bnb.nn.Linear4bit)
+        if not is_linear_like:
+            continue
+        rows.append(_linear_inventory_row(name, submodule))
+    payload = {
+        "quant_impl": _mtp_quant_name(),
+        "n_linear_total": len(rows),
+        "n_quantized": sum(int(row["quantized"]) for row in rows),
+        "n_bnb_nf4": sum(1 for row in rows if row["assigned_quant_method"] == "bnb_nf4"),
+        "n_int4_weightonly": sum(1 for row in rows if row["assigned_quant_method"] == "int4_weightonly"),
+        "n_fp": sum(1 for row in rows if not row["quantized"]),
+        "inventory": rows,
+    }
+    try:
+        inventory_path = Path(path)
+        inventory_path.parent.mkdir(parents=True, exist_ok=True)
+        inventory_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info("code_predictor: wrote MTP quant inventory to %s", str(inventory_path))
+    except Exception as exc:
+        logger.warning("code_predictor: failed to write MTP quant inventory: %s", exc)
+
+
+'''
+if "_dump_mtp_quant_inventory" not in code_text:
+    if inventory_helper_anchor not in code_text:
+        raise SystemExit(f"Could not patch {code_predictor_path}: inventory helper anchor")
+    code_text = code_text.replace(inventory_helper_anchor, inventory_helper, 1)
+    changed = True
+    print(f"patched {code_predictor_path}: added MTP quant inventory dump helper")
+else:
+    print(f"already patched {code_predictor_path}: MTP quant inventory dump helper")
+
+old_finalize = '''            if _uses_mtp_quant(self._vllm_config):
+                _finalize_mtp_quant_modules(self)
+
+            return loaded
+'''
+new_finalize = '''            if _uses_mtp_quant(self._vllm_config):
+                _finalize_mtp_quant_modules(self)
+                _dump_mtp_quant_inventory(self)
+
+            return loaded
+'''
+code_text, did_replace = replace_once(code_text, old_finalize, new_finalize, "dump MTP quant inventory after finalize")
+if did_replace:
+    changed = True
+    print(f"patched {code_predictor_path}: dump MTP quant inventory after finalize")
+elif "_dump_mtp_quant_inventory(self)" in code_text:
+    print(f"already patched {code_predictor_path}: dump MTP quant inventory after finalize")
+else:
+    raise SystemExit(f"Could not patch {code_predictor_path}: dump MTP quant inventory after finalize")
+
+if changed:
+    code_predictor_path.write_text(code_text, encoding="utf-8")
 PY

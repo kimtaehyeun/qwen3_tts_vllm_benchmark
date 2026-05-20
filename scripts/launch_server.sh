@@ -109,8 +109,18 @@ PY
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_PATH="$LOG_DIR/server_${TIMESTAMP}.log"
 PID_FILE="$LOG_DIR/server.pid"
+MTP_INVENTORY_PATH="$LOG_DIR/mtp_quant_inventory_${TIMESTAMP}.json"
+
+if [ "$MTP_QUANT" = "bitsandbytes" ] || [ "$MTP_QUANT" = "int4_weightonly" ] || [ "$MTP_QUANT" = "int4" ]; then
+  export QWEN3_TTS_MTP_INVENTORY_PATH="$MTP_INVENTORY_PATH"
+else
+  unset QWEN3_TTS_MTP_INVENTORY_PATH || true
+fi
 
 echo "Launching server with command: $CMD"
+if [ "${QWEN3_TTS_MTP_INVENTORY_PATH:-}" != "" ]; then
+  echo "MTP quant inventory: $QWEN3_TTS_MTP_INVENTORY_PATH"
+fi
 if command -v setsid >/dev/null 2>&1; then
   setsid bash -lc "$CMD" >"$LOG_PATH" 2>&1 < /dev/null &
 else

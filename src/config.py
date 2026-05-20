@@ -56,7 +56,7 @@ class BenchmarkConfig:
     request_rate: float = float('inf')
     timeout_sec: int = 300
     save_audio: bool = True
-    metrics_sample_interval_sec: float = 0.2
+    metrics_sample_interval_sec: float = 0.5
     repeat_per_sample: int = 1
 
 

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import glob
 import json
 import math
 import os
@@ -9,7 +10,7 @@ import sys
 import time
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 import pandas as pd
@@ -40,7 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--sample-rate', type=int, help='Audio sample rate')
     parser.add_argument('--request-rate', type=float, help='Target request rate per second')
     parser.add_argument('--repeat-per-sample', type=int, help='Repeat each sample this many times')
-    parser.add_argument('--batch-size', type=int, default=1, help='Number of samples per batch request')
+    parser.add_argument('--batch-size', type=int, default=1, help='Logical batch size for grouping/reporting samples')
+    parser.add_argument('--metrics-sample-interval-sec', type=float, help='GPU/process metrics sampling interval seconds')
     parser.add_argument('--subset', action='append', help='Subset filter: clean, noisy, numeric')
     parser.add_argument('--limit', type=int, help='Limit number of manifest rows for benchmark')
     parser.add_argument('--seed', type=int, help='Random seed for manifest ordering')
@@ -84,6 +86,8 @@ def merge_config_with_args(config: Dict[str, Any], args: argparse.Namespace) -> 
         config['benchmark']['repeat_per_sample'] = args.repeat_per_sample
     if args.batch_size is not None:
         config['benchmark']['batch_size'] = args.batch_size
+    if args.metrics_sample_interval_sec is not None:
+        config['benchmark']['metrics_sample_interval_sec'] = args.metrics_sample_interval_sec
     if args.subset is not None:
         config['benchmark']['subset'] = args.subset
     if args.limit is not None:
@@ -667,11 +671,32 @@ def _save_artifacts(output_dir: str, requests: List[Dict[str, Any]], summary_row
 
 
 def _copy_server_log(output_dir: str, repo_root: str) -> None:
-    source = os.path.join(repo_root, 'logs', 'server.log')
+    log_dir = os.path.join(repo_root, 'logs')
+    source = os.path.join(log_dir, 'server.log')
+    if not os.path.exists(source):
+        candidates = sorted(glob.glob(os.path.join(log_dir, 'server_*.log')), key=os.path.getmtime, reverse=True)
+        source = candidates[0] if candidates else source
     if os.path.exists(source):
-        dest = os.path.join(output_dir, 'server.log')
+        dest = os.path.join(output_dir, os.path.basename(source))
         with open(source, 'r', encoding='utf-8', errors='ignore') as source_file:
             with open(dest, 'w', encoding='utf-8') as dest_file:
+                dest_file.write(source_file.read())
+    inventory_candidates = sorted(
+        glob.glob(os.path.join(log_dir, 'mtp_quant_inventory_*.json')),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    if os.path.exists(source):
+        source_mtime = os.path.getmtime(source)
+        inventory_candidates = [
+            candidate for candidate in inventory_candidates
+            if os.path.getmtime(candidate) >= source_mtime - 5.0
+        ]
+    if inventory_candidates:
+        inventory_source = inventory_candidates[0]
+        inventory_dest = os.path.join(output_dir, os.path.basename(inventory_source))
+        with open(inventory_source, 'r', encoding='utf-8', errors='ignore') as source_file:
+            with open(inventory_dest, 'w', encoding='utf-8') as dest_file:
                 dest_file.write(source_file.read())
 
 
@@ -702,12 +727,74 @@ def _build_request_audio_path(base_audio_dir: str, subset: str, pair_id: str, co
     return os.path.join(dest_dir, f'{pair_id}_c{concurrency}.wav')
 
 
+def _logical_batch_id(sample_index: int, batch_size: int) -> int:
+    normalized_batch_size = max(1, int(batch_size or 1))
+    return (sample_index // normalized_batch_size) + 1
+
+
+def _make_request_error_record(
+    sample: BenchmarkSample,
+    run_id: str,
+    concurrency: int,
+    batch_id: Optional[int],
+    error_type: str,
+    error_message: str,
+) -> Dict[str, Any]:
+    return {
+        'run_id': run_id,
+        'request_id': sample.pair_id,
+        'row_index': sample.row_index,
+        'subset': sample.subset,
+        'pair_id': sample.pair_id,
+        'concurrency': concurrency,
+        'batch_id': batch_id,
+        'success': False,
+        'error_type': error_type,
+        'error_message': error_message,
+        'http_status_code': None,
+        'ref_audio_path': sample.ref_audio_path,
+        'ref_audio_relpath': sample.ref_audio_relpath,
+        'resolved_ref_audio_path': sample.resolved_ref_audio_path,
+        'ref_duration_sec': sample.ref_duration_sec,
+        'ref_text': sample.ref_text,
+        'target_text': sample.target_text,
+        'target_text_len': len(sample.target_text or ''),
+        'target_audio_path': sample.target_audio_path,
+        'target_audio_relpath': sample.target_audio_relpath,
+        'target_duration_sec': sample.target_duration_sec,
+        'request_start_time_iso': datetime.now(timezone.utc).isoformat(),
+        'request_end_time_iso': datetime.now(timezone.utc).isoformat(),
+        'end_to_end_latency_sec': None,
+        'time_to_first_byte_sec': None,
+        'time_to_first_audio_chunk_sec': None,
+        'response_format': None,
+        'output_audio_path': None,
+        'output_audio_bytes': None,
+        'audio_duration_sec': None,
+        'rtf': None,
+        'end_to_end_rtf': None,
+        'audio_throughput_sec_per_sec': None,
+        'end_to_end_audio_throughput_sec_per_sec': None,
+        'post_first_audio_chunk_latency_sec': None,
+        'steady_state_audio_throughput_sec_per_sec': None,
+        'steady_state_streaming_rtf': None,
+        'steady_state_metric_status': 'request_failed',
+        'audio_bytes_per_sec': None,
+        'prompt_tokens': None,
+        'completion_tokens': None,
+        'total_tokens': None,
+        'tokens_per_sec': None,
+        'output_tokens_per_sec': None,
+        'end_to_end_output_tokens_per_sec': None,
+        'token_metric_status': 'unavailable_from_endpoint_or_metrics',
+    }
+
+
 def _start_warmup(client: TTSClient, warmup_samples: List[BenchmarkSample], run_id: str, output_base: str, concurrency: int, request_rate: float) -> None:
     if not warmup_samples:
         return
     print(f'Running warmup {len(warmup_samples)} samples at concurrency {concurrency}')
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(_run_requests(client, warmup_samples, run_id, output_base, concurrency, request_rate, warmup=True))
+    asyncio.run(_run_requests(client, warmup_samples, run_id, output_base, concurrency, request_rate, warmup=True))
 
 
 async def _run_requests(
@@ -719,44 +806,105 @@ async def _run_requests(
     request_rate: float,
     warmup: bool = False,
     batch_id: Optional[int] = None,
+    batch_size: int = 1,
     progress_desc: Optional[str] = None,
+    records_sink: Optional[List[Dict[str, Any]]] = None,
+    on_record: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[Dict[str, Any]]:
-    semaphore = asyncio.Semaphore(concurrency)
-    records: List[Dict[str, Any]] = []
+    records: List[Dict[str, Any]] = records_sink if records_sink is not None else []
+    initial_record_count = len(records)
     request_interval = 1.0 / request_rate if request_rate and math.isfinite(request_rate) and request_rate > 0 else 0.0
+    valid_items = [(index, sample) for index, sample in enumerate(samples) if sample.valid]
+    if not valid_items:
+        return []
 
-    async def _request_worker(sample: BenchmarkSample) -> None:
-        async with semaphore:
-            if not sample.valid:
-                return
-            output_audio_path = None
-            if not warmup and client.tts_config.get('save_audio', True):
-                output_audio_path = _build_request_audio_path(audio_root, sample.subset, sample.pair_id, concurrency)
-            record = await client.request_sample(sample, run_id, concurrency, output_audio_path=output_audio_path, batch_id=batch_id)
-            if not warmup:
-                records.append(record.__dict__)
-            if request_interval > 0:
-                await asyncio.sleep(request_interval)
+    queue: asyncio.Queue = asyncio.Queue()
+    for item in valid_items:
+        queue.put_nowait(item)
 
-    tasks = [asyncio.create_task(_request_worker(sample)) for sample in samples if sample.valid]
     progress = None
-    if progress_desc and tasks:
+    pacing_lock = asyncio.Lock()
+    next_request_time = time.perf_counter()
+
+    async def _pace_request_start() -> None:
+        nonlocal next_request_time
+        if request_interval <= 0:
+            return
+        async with pacing_lock:
+            now = time.perf_counter()
+            wait_sec = max(0.0, next_request_time - now)
+            scheduled_start = max(now, next_request_time)
+            next_request_time = scheduled_start + request_interval
+        if wait_sec > 0:
+            await asyncio.sleep(wait_sec)
+
+    def _append_record(record: Dict[str, Any]) -> None:
+        if warmup:
+            return
+        records.append(record)
+        if on_record is not None:
+            try:
+                on_record(record)
+            except Exception:
+                pass
+
+    worker_count = min(max(1, int(concurrency or 1)), len(valid_items))
+    limits = httpx.Limits(
+        max_connections=max(worker_count + 4, 8),
+        max_keepalive_connections=max(worker_count, 4),
+    )
+
+    async def _request_worker(http_client: httpx.AsyncClient) -> None:
+        while True:
+            try:
+                sample_index, sample = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            current_batch_id = batch_id if batch_id is not None else _logical_batch_id(sample_index, batch_size)
+            try:
+                await _pace_request_start()
+                output_audio_path = None
+                if not warmup and client.tts_config.get('save_audio', True):
+                    output_audio_path = _build_request_audio_path(audio_root, sample.subset, sample.pair_id, concurrency)
+                record = await client.request_sample(
+                    sample,
+                    run_id,
+                    concurrency,
+                    output_audio_path=output_audio_path,
+                    batch_id=current_batch_id,
+                    http_client=http_client,
+                )
+                _append_record(record.__dict__)
+            except Exception as exc:
+                _append_record(_make_request_error_record(
+                    sample,
+                    run_id,
+                    concurrency,
+                    current_batch_id,
+                    type(exc).__name__,
+                    str(exc),
+                ))
+            finally:
+                if progress is not None:
+                    progress.update(1)
+                queue.task_done()
+
+    if progress_desc and valid_items:
         progress = tqdm(
-            total=len(tasks),
+            total=len(valid_items),
             desc=progress_desc,
             unit='req',
             dynamic_ncols=True,
             file=sys.stdout,
         )
     try:
-        for task in asyncio.as_completed(tasks):
-            await task
-            if progress is not None:
-                progress.update(1)
+        async with httpx.AsyncClient(timeout=client.timeout_sec, limits=limits) as http_client:
+            workers = [asyncio.create_task(_request_worker(http_client)) for _ in range(worker_count)]
+            await asyncio.gather(*workers)
     finally:
         if progress is not None:
             progress.close()
-    return records
+    return records[initial_record_count:]
 
 
 def main() -> None:
@@ -892,25 +1040,23 @@ def main() -> None:
         warmup_samples = valid_samples[:warmup_requests]
         warmup_count_done = len(warmup_samples)
         warmup_client = TTSClient(api_base, {**config['tts'], 'save_audio': False}, timeout_sec=timeout_sec)
-        warmup_batches = [warmup_samples[i:i + batch_size] for i in range(0, len(warmup_samples), batch_size)]
-        for batch_id, batch in enumerate(warmup_batches, start=1):
-            try:
-                asyncio.run(_run_requests(
-                    warmup_client,
-                    batch,
-                    run_id,
-                    output_paths['audio'],
-                    concurrency=1,
-                    request_rate=request_rate,
-                    warmup=True,
-                    batch_id=batch_id,
-                    progress_desc=f'warmup batch {batch_id}/{len(warmup_batches)}',
-                ))
-                warmup_ok += len(batch)
-            except Exception:
-                error_path = os.path.join(log_dir, f'{run_id}_warmup_{batch_id:02d}_error.txt')
-                with open(error_path, 'w', encoding='utf-8') as f:
-                    f.write(traceback.format_exc())
+        try:
+            asyncio.run(_run_requests(
+                warmup_client,
+                warmup_samples,
+                run_id,
+                output_paths['audio'],
+                concurrency=1,
+                request_rate=request_rate,
+                warmup=True,
+                batch_size=batch_size,
+                progress_desc='warmup',
+            ))
+            warmup_ok = len(warmup_samples)
+        except Exception:
+            error_path = os.path.join(log_dir, f'{run_id}_warmup_error.txt')
+            with open(error_path, 'w', encoding='utf-8') as f:
+                f.write(traceback.format_exc())
 
     all_records: List[Dict[str, Any]] = []
     summary_rows: List[Dict[str, Any]] = []
@@ -930,31 +1076,38 @@ def main() -> None:
         batched_samples = []
         for _ in range(repeat_per_sample):
             batched_samples.extend(valid_samples)
-        batch_groups = [batched_samples[i:i + batch_size] for i in range(0, len(batched_samples), batch_size)]
         records: List[Dict[str, Any]] = []
         partial_every_n = int(config['benchmark'].get('write_partial_csv_every_n', 10) or 10)
-        for batch_id, batch in enumerate(batch_groups, start=1):
-            try:
-                new_records = asyncio.run(_run_requests(
-                    client,
-                    batch,
-                    run_id,
-                    output_paths['audio'],
-                    concurrency,
-                    request_rate,
-                    warmup=False,
-                    batch_id=batch_id,
-                    progress_desc=f'c{concurrency} batch {batch_id}/{len(batch_groups)}',
-                ))
-            except Exception:
-                error_path = os.path.join(log_dir, f'{run_id}_c{concurrency}_batch_{batch_id:04d}_error.txt')
-                with open(error_path, 'w', encoding='utf-8') as f:
-                    f.write(traceback.format_exc())
-                new_records = []
-            records.extend(new_records)
-            current_records = [*all_records, *records]
-            if new_records and (len(records) % partial_every_n == 0 or batch_id == len(batch_groups)):
-                _write_partial_manifest(partial_manifest_path, current_records, run_id, config, settings_path, prompt_list_path)
+        last_partial_count = 0
+
+        def _on_record(_record: Dict[str, Any]) -> None:
+            nonlocal last_partial_count
+            if partial_every_n <= 0:
+                return
+            if len(records) - last_partial_count >= partial_every_n:
+                _write_partial_manifest(partial_manifest_path, [*all_records, *records], run_id, config, settings_path, prompt_list_path)
+                last_partial_count = len(records)
+
+        try:
+            asyncio.run(_run_requests(
+                client,
+                batched_samples,
+                run_id,
+                output_paths['audio'],
+                concurrency,
+                request_rate,
+                warmup=False,
+                batch_size=batch_size,
+                progress_desc=f'c{concurrency}',
+                records_sink=records,
+                on_record=_on_record,
+            ))
+        except Exception:
+            error_path = os.path.join(log_dir, f'{run_id}_c{concurrency}_error.txt')
+            with open(error_path, 'w', encoding='utf-8') as f:
+                f.write(traceback.format_exc())
+        if records:
+            _write_partial_manifest(partial_manifest_path, [*all_records, *records], run_id, config, settings_path, prompt_list_path)
         end_time = time.perf_counter()
         collector.stop()
         memory_all_samples.extend(collector.samples)

@@ -30,6 +30,30 @@ tts:
   voice: null
   instructions: null
 
+torch_runtime:
+  attn_implementation: flash_attention_2
+  require_flash_attention: true
+  flash_attention:
+    install: true
+    package: flash-attn
+    version: null
+    no_build_isolation: true
+    no_cache_dir: true
+    max_jobs: 4
+    cuda_arch_list: null
+    extra_pip_args: []
+    show_progress: true
+    progress_interval_sec: 30
+    log_dir: logs
+  max_new_tokens: 512
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 50
+  do_sample: true
+  subtalker_dosample: false
+  use_cache: true
+  autocast_bf16: true
+
 manifest:
   path: /workspace/qwen3_tts_vllm_benchmark/data/reference/manifest/reference_manifest.csv
   audio_root: /workspace/qwen3_tts_vllm_benchmark/data/reference/Audio/reference/reference
@@ -43,5 +67,5 @@ benchmark:
   request_rate: inf
   timeout_sec: 300
   save_audio: true
-  metrics_sample_interval_sec: 0.2
+  metrics_sample_interval_sec: 0.5
   repeat_per_sample: 1

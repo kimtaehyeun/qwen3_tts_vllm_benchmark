@@ -167,11 +167,10 @@ class TTSClient:
         start = time.perf_counter()
         time_to_first_byte = None
         time_to_first_chunk = None
-        output_bytes = b''
+        output_buffer = bytearray()
         status_code = None
         headers = None
         response_json: Optional[Dict[str, Any]] = None
-        error_message = None
 
         async with client.stream('POST', url, json=data if files is None else None, data=None if files is None else data, files=files, timeout=self.timeout_sec) as response:
             status_code = response.status_code
@@ -182,7 +181,8 @@ class TTSClient:
                     first_chunk_time = time.perf_counter()
                     time_to_first_chunk = first_chunk_time - start
                     time_to_first_byte = time_to_first_chunk
-                output_bytes += chunk
+                output_buffer.extend(chunk)
+            output_bytes = bytes(output_buffer)
             if headers and headers.get('content-type', '').startswith('application/json'):
                 try:
                     response_json = json.loads(output_bytes.decode('utf-8', errors='ignore'))
@@ -221,7 +221,15 @@ class TTSClient:
             result['token_metric_status'] = 'unavailable_from_endpoint_or_metrics'
         return result
 
-    async def request_sample(self, sample: Any, run_id: str, concurrency: int, output_audio_path: Optional[str] = None, batch_id: Optional[int] = None) -> RequestRecord:
+    async def request_sample(
+        self,
+        sample: Any,
+        run_id: str,
+        concurrency: int,
+        output_audio_path: Optional[str] = None,
+        batch_id: Optional[int] = None,
+        http_client: Optional[httpx.AsyncClient] = None,
+    ) -> RequestRecord:
         request_id = sample.pair_id
         request_start = time.perf_counter()
         start_time_iso = datetime.now(timezone.utc).isoformat()
@@ -298,9 +306,11 @@ class TTSClient:
         else:
             data = payload
 
-        async with httpx.AsyncClient(timeout=self.timeout_sec) as client:
+        owns_http_client = http_client is None
+        request_client = http_client or httpx.AsyncClient(timeout=self.timeout_sec)
+        try:
             try:
-                response = await self._fetch_response(client, url, data=data, files=files)
+                response = await self._fetch_response(request_client, url, data=data, files=files)
             except Exception as exc:
                 record.error_type = type(exc).__name__
                 record.error_message = str(exc)
@@ -312,6 +322,9 @@ class TTSClient:
                             fileobj[1].close()
                         except Exception:
                             pass
+        finally:
+            if owns_http_client:
+                await request_client.aclose()
 
         record.http_status_code = response['status_code']
         record.time_to_first_byte_sec = response.get('time_to_first_byte_sec')
@@ -329,6 +342,7 @@ class TTSClient:
             return record
 
         record.output_audio_bytes = len(output_bytes)
+        record.audio_duration_sec = get_audio_duration_from_bytes(output_bytes)
         if output_audio_path:
             try:
                 save_audio_bytes(output_audio_path, output_bytes)
@@ -342,11 +356,8 @@ class TTSClient:
         record.request_end_time_iso = datetime.now(timezone.utc).isoformat()
         record.end_to_end_latency_sec = time.perf_counter() - request_start
 
-        record.audio_duration_sec = None
-        if output_audio_path:
+        if record.audio_duration_sec is None and output_audio_path:
             record.audio_duration_sec = get_audio_duration(output_audio_path)
-        if record.audio_duration_sec is None:
-            record.audio_duration_sec = get_audio_duration_from_bytes(output_bytes)
 
         if record.audio_duration_sec is not None and record.audio_duration_sec > 0:
             record.rtf = record.end_to_end_latency_sec / record.audio_duration_sec

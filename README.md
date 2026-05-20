@@ -139,7 +139,7 @@ python -u -m src.benchmark_manifest \
 
 `--concurrency` controls how many inference requests can run at the same time.
 
-`--batch-size` controls how many samples the benchmark schedules into one async group. In this client it is not a single GPU tensor batch. To make concurrency effective across all 300 samples, use `--batch-size 300`.
+`--batch-size` is a logical grouping value used for `batch_id` and Colab-compatible reporting. In the vLLM HTTP client it is not a single GPU tensor batch, and it no longer limits whether `--concurrency` is effective.
 
 Examples:
 
@@ -150,7 +150,7 @@ python -u -m src.benchmark_manifest \
   --output-dir results/reference_all_parallel_c2 \
   --warmup-requests 5 \
   --concurrency 2 \
-  --batch-size 300 \
+  --batch-size 1 \
   --save-audio \
   --response-format wav
 ```
@@ -163,7 +163,7 @@ python -u -m src.benchmark_manifest \
   --output-dir results/reference_all_parallel_c8 \
   --warmup-requests 5 \
   --concurrency 8 \
-  --batch-size 300 \
+  --batch-size 1 \
   --save-audio \
   --response-format wav
 ```
@@ -171,13 +171,13 @@ python -u -m src.benchmark_manifest \
 Behavior:
 
 ```text
---concurrency 2 --batch-size 300
+--concurrency 2 --batch-size 1
   -> schedules 300 samples
   -> keeps up to 2 requests in flight
   -> starts the next sample as soon as one finishes
 ```
 
-If `--batch-size 1`, each group contains only one sample, so `--concurrency 2` or higher has little practical effect.
+The benchmark uses a worker queue internally, so `--concurrency 8` means up to 8 HTTP inference requests are in flight regardless of `--batch-size`.
 
 ## Smoke test
 
@@ -193,7 +193,7 @@ python -u -m src.benchmark_manifest \
 
 ## Progress and logs
 
-The benchmark prints a `tqdm` progress bar for warmup and each concurrency/batch group. To append benchmark progress into the latest server log:
+The benchmark prints a `tqdm` progress bar for warmup and each concurrency run. To append benchmark progress into the latest server log:
 
 ```bash
 SERVER_LOG="$(ls -t logs/server_*.log | head -n1)"
@@ -203,7 +203,7 @@ python -u -m src.benchmark_manifest \
   --output-dir results/reference_all_parallel_c8 \
   --warmup-requests 5 \
   --concurrency 8 \
-  --batch-size 300 \
+  --batch-size 1 \
   --save-audio \
   --response-format wav \
   2>&1 | tee -a "$SERVER_LOG"
@@ -291,9 +291,11 @@ pip install -r requirements.txt
 Then run the full comparison:
 
 ```bash
-LIMIT=300 WARMUP=5 CONCURRENCY=1 TORCH_BATCH_SIZE=1 VLLM_BATCH_SIZE=1 \
+LIMIT=300 WARMUP=5 CONCURRENCY=8 TORCH_BATCH_SIZE=4 VLLM_BATCH_SIZE=1 \
   bash scripts/run_4way_benchmark.sh
 ```
+
+`TORCH_BATCH_SIZE=4` keeps the direct PyTorch path busier on GPU by batching multiple samples in one `generate_voice_clone` call. Use `TORCH_BATCH_SIZE=1` only when you need strictly one-sample-at-a-time latency semantics.
 
 The script writes one result directory per condition:
 
@@ -315,7 +317,38 @@ LIMIT=1 WARMUP=0 CONCURRENCY=1 bash scripts/run_4way_benchmark.sh
 
 The comparison table includes latency, RTF, audio throughput, steady-state streaming metrics when available, success rate, GPU memory peak/mean, GPU utilization, load time, and model memory footprint. Torch direct runtime does not expose a real first audio chunk timestamp, so its steady-state streaming metrics remain unavailable with `steady_state_metric_status=missing_time_to_first_audio_chunk`.
 
-For torch direct runtime, `--attn-implementation auto` is the default: it uses `flash_attention_2` only when the `flash_attn` package is installed, otherwise it falls back to `sdpa`. If you want to force the official FlashAttention2 path, install `flash-attn` first and pass `--attn-implementation flash_attention_2` to `python -m src.benchmark_torch`.
+For torch direct runtime, `configs/qwen3_tts_base.yaml` now forces `attn_implementation: flash_attention_2` and `require_flash_attention: true`. If `flash_attn` is missing, `python -m src.benchmark_torch` stops with a clear install command instead of silently falling back to `sdpa`.
+
+The torch config can also install FlashAttention before running:
+
+```yaml
+torch_runtime:
+  attn_implementation: flash_attention_2
+  require_flash_attention: true
+  flash_attention:
+    install: true
+    package: flash-attn
+    no_build_isolation: true
+    no_cache_dir: true
+    max_jobs: 4
+    cuda_arch_list: null
+    show_progress: true
+    progress_interval_sec: 30
+```
+
+Manual install with progress logging:
+
+```bash
+bash scripts/install_flash_attention.sh configs/qwen3_tts_base.yaml
+```
+
+The installer streams pip/ninja/nvcc output to stdout and writes a log like `logs/flash_attention_install_<timestamp>.log`. When `show_progress=true`, it also prints periodic process and disk status while the CUDA extension is compiling.
+
+The 4-way benchmark calls this installer before each torch run by default. To skip it after `flash_attn` is already installed:
+
+```bash
+INSTALL_FLASH_ATTN=0 LIMIT=300 WARMUP=5 bash scripts/run_4way_benchmark.sh
+```
 
 ## Stop server
 

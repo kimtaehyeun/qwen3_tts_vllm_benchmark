@@ -22,7 +22,7 @@ server:
   bit_width: 4
   llm_bit: 4
   mtp_bit: 4
-  mtp_quantization: int4_weightonly
+  mtp_quantization: bitsandbytes
   extra_vllm_args: []
 
 tts:
@@ -50,6 +50,6 @@ benchmark:
   request_rate: inf
   timeout_sec: 300
   save_audio: true
-  metrics_sample_interval_sec: 0.2
+  metrics_sample_interval_sec: 0.5
   repeat_per_sample: 1
   write_partial_csv_every_n: 10
